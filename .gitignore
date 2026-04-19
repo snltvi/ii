@@ -1,0 +1,4 @@
+sensors_cache.json
+*.xlsx
+*.html
+__pycache__/

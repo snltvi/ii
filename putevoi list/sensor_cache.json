@@ -1,0 +1,20 @@
+{
+  "8124": {
+    "odo_sid": 115954,
+    "odo_name": "CAN Абсолютный пробег",
+    "fuel_sid": 0,
+    "fuel_name": "Параметр (LLS 1)"
+  },
+  "7312": {
+    "odo_sid": 99863,
+    "odo_name": "CAN Абсолютный пробег",
+    "fuel_sid": 0,
+    "fuel_name": "Датчик LLS (FuelLevelzer 1)"
+  },
+  "7251": {
+    "odo_sid": 98393,
+    "odo_name": "CAN Абсолютный пробег",
+    "fuel_sid": 0,
+    "fuel_name": "Датчик LLS (FuelLevelzer 1)"
+  }
+}

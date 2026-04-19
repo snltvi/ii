@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gps.mobiteam.com.ua)",
+      "Bash(find \"c:\\\\Users\\\\snltv\\\\Desktop\\\\ii\\\\API\\\\\" -type f -name \"*.py\" | head -50)",
+      "Bash(python -m py_compile abv_putevoy_list_full.py)",
+      "Bash(python -m py_compile first_movement.py)",
+      "Bash(python -m py_compile export_sensors.py)",
+      "Bash(python -m py_compile sensor_values_day.py)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \"808\")",
+      "Bash(taskkill /PID 17192 /F)",
+      "Bash(taskkill //PID 17192 //F)",
+      "Bash(python3 -c \"import pandas as pd; df = pd.read_excel\\('/c/Users/snltv/Desktop/ii/mobiteam_scripts/Cцепка_водитель-авто-прицеп_на_20_01_2026_с_ID_объектов.xlsx'\\); print\\(df.columns.tolist\\(\\)\\); print\\(df.head\\(30\\).to_string\\(\\)\\)\")",
+      "Bash(python -c \"import pandas as pd; df = pd.read_excel\\('/c/Users/snltv/Desktop/ii/mobiteam_scripts/Cцепка_водитель-авто-прицеп_на_20_01_2026_с_ID_объектов.xlsx'\\); print\\(df.columns.tolist\\(\\)\\); print\\(df.head\\(30\\).to_string\\(\\)\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(where python *)",
+      "Bash(python -m pip install pandas openpyxl)"
+    ]
+  }
+}
