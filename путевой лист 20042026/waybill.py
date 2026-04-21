@@ -2,7 +2,46 @@
 # -*- coding: utf-8 -*-
 """
 Путевой лист — веб-интерфейс
+=============================================================================
 Запуск: python waybill.py  →  открывается браузер на http://localhost:8080
+
+Используемые методы API (https://gps.mobiteam.com.ua/api/integration/v1):
+  GET /connect            — авторизация (login/password → SessionId)
+  GET /getobjectslist     — список всех ТС
+  GET /objsensorslist     — список датчиков ТС (кешируется в sensors_cache.json)
+  GET /objdata            — значения датчиков за период (уровень топлива)
+  GET /getobjectsreport   — сводной отчёт за период:
+                              start_address  — адрес начала рейса
+                              stop_address   — адрес окончания рейса
+                              can_dist       — пробег по CAN (км), показания
+                                              бортового компьютера, не зависит от GPS
+                              fuelings       — объём заправок за период (л)
+  GET /track              — GPS-трек (используется для определения
+                              времени выезда и возврата)
+  GET /stops              — список стоянок ТС за период с координатами
+                              и длительностью; фильтрация по минимальному
+                              времени стоянки задаётся пользователем
+                              (по умолчанию 1440 мин = 24 часа)
+  GET /getaddress         — обратное геокодирование (lat/lon → адрес)
+
+Справочник водитель↔авто:
+  Cцепка_водитель-авто-прицеп_на_20_01_2026_с_ID_объектов.xlsx
+  Колонки: [1]=ФИО, [2]=ID объекта
+
+Форма ввода (браузер):
+  • Выбор ТС — автоматически подставляет водителя из справочника
+  • Даты рейса (начало / конец)
+  • Минимальное время стоянки (мин), по умолчанию 1440 мин (24 ч)
+  • № заявки, Название груза, Вес груза (т)
+
+Путевой лист содержит:
+  • Общие сведения (ТС, водитель, период)
+  • Груз и заявка
+  • Маршрут (адрес и время выезда / возврата)
+  • Пробег по CAN за рейс
+  • Топливо (уровень баков при выезде и возврате, заправлено за рейс)
+  • Стоянки дольше заданного порога (адрес, начало, конец, длительность)
+=============================================================================
 """
 
 import requests, sys, json, os, webbrowser
@@ -30,6 +69,8 @@ STOP_MIN = 60
 FUEL_COMBINED = ["топливо"]
 FUEL_TANK     = ["бак"]
 FUEL_EXCLUDE  = ["расход", "температур", "°t", "уровень", "%", "can уровень"]
+
+ODO_KEYWORDS  = ["датчик накопленного пробега", "can абсолютный пробег", "абсолютный пробег"]
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def connect():
@@ -88,6 +129,15 @@ def load_sensor_cache(headers, objects):
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
     return vehicles_cache
+
+def find_odo_sensor(sensors):
+    for s in sensors:
+        lo = s.get("name", "").lower().strip()
+        if any(kw in lo for kw in ODO_KEYWORDS):
+            sid_v, pid_v = s.get("sid", 0), s.get("pid", 0)
+            if sid_v > 0: return (f"s{sid_v}", s["name"].strip())
+            if pid_v > 0: return (f"p{pid_v}", s["name"].strip())
+    return None
 
 def find_fuel_sensors(sensors):
     """Приоритет: единый 'Топливо' > Бак1+Бак2. Исключает температуру, расход, уровень%."""
@@ -168,28 +218,56 @@ def parse_dt(s):
         except: pass
     return None
 
-# ── Stops from track ──────────────────────────────────────────────────────────
-def find_stops(headers, oid, dt_from, dt_to, min_minutes=60):
-    track = get_track(headers, oid, dt_from, dt_to)
-    if not track: return []
-    points = []
-    for p in track:
-        t = parse_dt(p.get("dt", ""))
-        if t and p.get("lat") and p.get("lon"):
-            points.append({"dt": t, "lat": float(p["lat"]), "lon": float(p["lon"])})
-    points.sort(key=lambda x: x["dt"])
-    stops = []
-    for i in range(len(points) - 1):
-        gap_min = (points[i+1]["dt"] - points[i]["dt"]).total_seconds() / 60
-        if gap_min >= min_minutes:
-            addr = get_address(headers, points[i]["lat"], points[i]["lon"])
-            stops.append({
-                "start": points[i]["dt"].strftime("%d.%m.%Y %H:%M"),
-                "end":   points[i+1]["dt"].strftime("%d.%m.%Y %H:%M"),
-                "dur":   int(gap_min),
-                "addr":  addr,
-            })
-    return stops
+# ── Stops via /stops API ──────────────────────────────────────────────────────
+def find_stops(headers, oid, dt_from, dt_to, min_minutes=1440):
+    """
+    Запрашивает стоянки через GET /stops.
+    min_minutes — минимальная длительность стоянки в минутах (по умолчанию 1440 = 24 ч).
+    API принимает фильтр в секундах (параметр time).
+    Возвращает список dict: start, end, dur (мин), dur_str, addr.
+    """
+    min_seconds = min_minutes * 60
+    # Запрашиваем у API стоянки >= 1 час, финальный фильтр делаем локально
+    api_filter = min(min_seconds, 3600)
+    try:
+        r = requests.get(f"{BASE_URL}/stops", headers=headers,
+                         params={"oid": oid, "from": dt_from, "to": dt_to,
+                                 "time": api_filter},
+                         timeout=30)
+        if r.status_code != 200: return []
+        data = r.json()
+        if data.get("result") != "Ok": return []
+        raw_stops = data.get("stops", [])
+    except Exception as e:
+        print(f"    /stops помилка: {e}")
+        return []
+
+    result = []
+    for s in raw_stops:
+        dur_sec = s.get("duration", 0)
+        if dur_sec < min_seconds:
+            continue
+
+        lat = s.get("lat")
+        lon = s.get("lon")
+        addr = get_address(headers, lat, lon) if lat and lon else "—"
+
+        stop_dt  = parse_dt(s.get("stop_time", ""))
+        end_sec  = (stop_dt.timestamp() + dur_sec) if stop_dt else None
+        end_str  = datetime.fromtimestamp(end_sec).strftime("%d.%m.%Y %H:%M") if end_sec else "—"
+
+        dur_min  = dur_sec // 60
+        d, h, m  = dur_min // 1440, (dur_min % 1440) // 60, dur_min % 60
+        dur_str  = (f"{d}д " if d else "") + f"{h:02d}:{m:02d}"
+
+        result.append({
+            "start":   stop_dt.strftime("%d.%m.%Y %H:%M") if stop_dt else "—",
+            "end":     end_str,
+            "dur":     dur_min,
+            "dur_str": dur_str,
+            "addr":    addr,
+        })
+    return result
 
 # ── Global state ──────────────────────────────────────────────────────────────
 SID      = None
@@ -262,7 +340,7 @@ td.hi{font-weight:700;color:#1e3a5f}
 # ── Form ──────────────────────────────────────────────────────────────────────
 def form_html():
     opts = "".join(
-        f"<option value='{o[\"id\"]}'>{o['name']}"
+        f"<option value='{o['id']}'>{o['name']}"
         f"{(' — ' + DRIVERS[o['id']]) if o['id'] in DRIVERS else ''}</option>"
         for o in OBJECTS
     )
@@ -287,6 +365,10 @@ def form_html():
       <div><label>Дата возврата</label>
            <input type="date" name="date_end" required></div>
     </div>
+
+    <label>Минимальное время стоянки (мин)</label>
+    <input name="stop_min" type="number" min="1" value="1440">
+    <div class="hint">По умолчанию 1440 мин = 24 часа. Введите меньше чтобы видеть короткие стоянки.</div>
 
     <label>№ Заявки</label>
     <input name="order_num" placeholder="Номер заявки (необязательно)">
@@ -315,7 +397,7 @@ fillDriver();
 
 # ── Waybill ───────────────────────────────────────────────────────────────────
 def waybill_html(oid, vehicle_name, driver, date_start, date_end,
-                 order_num, cargo_name, cargo_weight):
+                 order_num, cargo_name, cargo_weight, stop_min=1440):
     ds, de = date_start, date_end
     dt_from = f"{ds} 00:00:00"
     dt_to   = f"{de} 23:59:59"
@@ -346,9 +428,18 @@ def waybill_html(oid, vehicle_name, driver, date_start, date_end,
     time_start = parse_dt(fp["dt"]).strftime("%d.%m.%Y %H:%M") if fp else ds_label
     time_end   = parse_dt(lp["dt"]).strftime("%d.%m.%Y %H:%M") if lp else de_label
 
+    # ── Одометр на начало/конец рейса ────────────────────────────────────────
+    print(f"  Одометр...")
+    sensors    = VEH_CACHE.get(str(oid), {}).get("sensors", [])
+    odo_sensor = find_odo_sensor(sensors)
+    if odo_sensor:
+        odo_start = query_objdata(HEADERS, oid, odo_sensor[0], ds, "first")
+        odo_end   = query_objdata(HEADERS, oid, odo_sensor[0], de, "last")
+    else:
+        odo_start = odo_end = None
+
     # ── Топливо — уровень баков на начало/конец ───────────────────────────────
     print(f"  Паливо (рівень баків)...")
-    sensors    = VEH_CACHE.get(str(oid), {}).get("sensors", [])
     fuel_pairs = find_fuel_sensors(sensors)
     fuel_start_rows, fuel_end_rows = [], []
     for slist, fname in fuel_pairs:
@@ -357,9 +448,9 @@ def waybill_html(oid, vehicle_name, driver, date_start, date_end,
     total_fs = sum(v for _, v in fuel_start_rows if v) or None
     total_fe = sum(v for _, v in fuel_end_rows   if v) or None
 
-    # ── Стоянки > 60 мин ─────────────────────────────────────────────────────
-    print(f"  Стоянки > {STOP_MIN} хв...")
-    stops = find_stops(HEADERS, oid, dt_from, dt_to, STOP_MIN)
+    # ── Стоянки (/stops API) ──────────────────────────────────────────────────
+    print(f"  Стоянки >= {stop_min} хв (API /stops)...")
+    stops = find_stops(HEADERS, oid, dt_from, dt_to, stop_min)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def fuel_td(rows, total):
@@ -371,9 +462,10 @@ def waybill_html(oid, vehicle_name, driver, date_start, date_end,
 
     stops_rows = "".join(
         f"<tr><td>{s['start']}</td><td>{s['end']}</td>"
-        f"<td class='num'>{s['dur']} мин</td><td>{s['addr']}</td></tr>"
+        f"<td class='num'>{s['dur_str']}</td><td>{s['addr']}</td></tr>"
         for s in stops
-    ) or "<tr><td colspan='4' style='text-align:center;color:#888'>Стоянок &gt; 60 мин не обнаружено</td></tr>"
+    ) or (f"<tr><td colspan='4' style='text-align:center;color:#888'>"
+          f"Стоянок &gt;= {stop_min} мин не обнаружено</td></tr>")
 
     cargo_block = ""
     if order_num or cargo_name or cargo_weight:
@@ -432,7 +524,7 @@ def waybill_html(oid, vehicle_name, driver, date_start, date_end,
   </div>
 
   <div class="section">
-    <h3>Стоянки более {STOP_MIN} минут</h3>
+    <h3>Стоянки более {stop_min} мин ({stop_min//60} ч {stop_min%60:02d} мин)</h3>
     <table>
       <tr><th width="145">Начало</th><th width="145">Конец</th>
           <th width="80">Длит.</th><th>Адрес</th></tr>
@@ -468,16 +560,17 @@ class Handler(BaseHTTPRequestHandler):
         driver       = body.get("driver",       ["—"])[0].strip() or "—"
         date_start   = body["date_start"][0]
         date_end     = body["date_end"][0]
+        stop_min     = int(body.get("stop_min", ["1440"])[0] or 1440)
         order_num    = body.get("order_num",    [""])[0].strip()
         cargo_name   = body.get("cargo_name",   [""])[0].strip()
         cargo_weight = body.get("cargo_weight", [""])[0].strip()
 
         vname = next((o["name"] for o in OBJECTS if o["id"] == oid), str(oid))
-        print(f"\nФормування путевого листа: {vname}  {date_start} — {date_end}")
+        print(f"\nФормування путевого листа: {vname}  {date_start} — {date_end}  стоянки>={stop_min}хв")
 
         try:
             html = waybill_html(oid, vname, driver, date_start, date_end,
-                                order_num, cargo_name, cargo_weight)
+                                order_num, cargo_name, cargo_weight, stop_min)
             self.send_html(html)
         except Exception as e:
             import traceback
