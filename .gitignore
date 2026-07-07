@@ -1,4 +1,6 @@
 sensors_cache.json
 *.xlsx
 *.html
+*.db
 __pycache__/
+.claude/settings.local.json
